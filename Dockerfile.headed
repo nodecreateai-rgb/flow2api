@@ -11,17 +11,42 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 COPY requirements.txt ./
 
-# 有头模式基础依赖：虚拟显示、窗口管理器。
+# 有头模式基础依赖：虚拟显示、窗口管理器 + Chromium 运行依赖。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         xvfb \
         fluxbox \
+        libnss3 \
+        libnspr4 \
+        libatk1.0-0 \
+        libatk-bridge2.0-0 \
+        libcups2 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxfixes3 \
+        libxrandr2 \
+        libgbm1 \
+        libasound2 \
+        libxkbcommon0 \
+        libx11-6 \
+        libx11-xcb1 \
+        libxcb1 \
+        libxext6 \
+        libxrender1 \
+        libxi6 \
+        libglib2.0-0 \
+        libpango-1.0-0 \
+        libcairo2 \
+        libfontconfig1 \
+        libfreetype6 \
+        fonts-liberation \
+        fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt \
-    && python -m playwright install --with-deps chromium
+    && python -m playwright install chromium
 
 COPY . .
 COPY docker/entrypoint.headed.sh /usr/local/bin/entrypoint.headed.sh
