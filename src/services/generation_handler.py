@@ -868,75 +868,118 @@ class GenerationHandler:
         )
 
         try:
-            # 3. 确保AT有效
-            debug_logger.log_info(f"[GENERATION] 检查Token AT有效性...")
-            if stream:
-                yield self._create_stream_chunk("初始化生成环境...\n")
+            generation_attempt = 0
+            while True:
+                generation_attempt += 1
+                # 3. 确保AT有效
+                debug_logger.log_info(f"[GENERATION] 检查Token AT有效性...")
+                if stream and generation_attempt == 1:
+                    yield self._create_stream_chunk("初始化生成环境...\n")
 
-            await self._update_request_log_progress(
-                request_log_state,
-                token_id=token.id,
-                status_text="token_ready",
-                progress=15,
-            )
-            ensure_at_started_at = time.time()
-            token = await self.token_manager.ensure_valid_token(token)
-            perf_trace["ensure_at_ms"] = int((time.time() - ensure_at_started_at) * 1000)
-            if not token:
-                error_msg = "Token AT无效或刷新失败"
-                debug_logger.log_error(f"[GENERATION] {error_msg}")
-                if stream:
-                    yield self._create_stream_chunk(f"❌ {error_msg}\n")
-                yield self._create_error_response(error_msg, status_code=503)
-                return
+                await self._update_request_log_progress(
+                    request_log_state,
+                    token_id=token.id,
+                    status_text="token_ready",
+                    progress=15,
+                )
+                ensure_at_started_at = time.time()
+                token = await self.token_manager.ensure_valid_token(token)
+                perf_trace["ensure_at_ms"] = int((time.time() - ensure_at_started_at) * 1000)
+                if not token:
+                    error_msg = "Token AT无效或刷新失败"
+                    debug_logger.log_error(f"[GENERATION] {error_msg}")
+                    if stream:
+                        yield self._create_stream_chunk(f"❌ {error_msg}\n")
+                    yield self._create_error_response(error_msg, status_code=503)
+                    return
 
-            # 4. 确保Project存在
-            debug_logger.log_info(f"[GENERATION] 检查/创建Project...")
+                # 4. 确保Project存在
+                debug_logger.log_info(f"[GENERATION] 检查/创建Project...")
 
-            if not supports_model_for_tier(model, token.user_paygate_tier):
-                required_tier = get_required_paygate_tier_for_model(model)
-                error_msg = "当前模型需要 " + get_paygate_tier_label(required_tier) + " 账号: " + model
-                debug_logger.log_error(f"[GENERATION] {error_msg}")
-                if stream:
-                    yield self._create_stream_chunk(f"❌ {error_msg}\n")
-                yield self._create_error_response(error_msg, status_code=403)
-                return
+                if not supports_model_for_tier(model, token.user_paygate_tier):
+                    required_tier = get_required_paygate_tier_for_model(model)
+                    error_msg = "当前模型需要 " + get_paygate_tier_label(required_tier) + " 账号: " + model
+                    debug_logger.log_error(f"[GENERATION] {error_msg}")
+                    if stream:
+                        yield self._create_stream_chunk(f"❌ {error_msg}\n")
+                    yield self._create_error_response(error_msg, status_code=403)
+                    return
 
-            ensure_project_started_at = time.time()
-            project_id = await self.token_manager.ensure_project_exists(token.id)
-            perf_trace["ensure_project_ms"] = int((time.time() - ensure_project_started_at) * 1000)
-            debug_logger.log_info(f"[GENERATION] Project ID: {project_id}")
-            await self._update_request_log_progress(
-                request_log_state,
-                token_id=token.id,
-                status_text="project_ready",
-                progress=22,
-                response_extra={"project_id": project_id},
-            )
+                ensure_project_started_at = time.time()
+                project_id = await self.token_manager.ensure_project_exists(token.id)
+                perf_trace["ensure_project_ms"] = int((time.time() - ensure_project_started_at) * 1000)
+                debug_logger.log_info(f"[GENERATION] Project ID: {project_id}")
+                await self._update_request_log_progress(
+                    request_log_state,
+                    token_id=token.id,
+                    status_text="project_ready",
+                    progress=22,
+                    response_extra={"project_id": project_id},
+                )
 
-            # 5. 根据类型处理
-            generation_pipeline_started_at = time.time()
-            if generation_type == "image":
-                debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
-                async for chunk in self._handle_image_generation(
-                    token, project_id, model_config, prompt, images, stream,
-                    perf_trace=perf_trace,
-                    generation_result=generation_result,
-                    request_log_state=request_log_state,
-                    pending_token_state=pending_token_state
-                ):
-                    yield chunk
-            else:  # video
-                debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
-                async for chunk in self._handle_video_generation(
-                    token, project_id, model_config, prompt, images, stream,
-                    perf_trace=perf_trace,
-                    generation_result=generation_result,
-                    request_log_state=request_log_state,
-                    pending_token_state=pending_token_state
-                ):
-                    yield chunk
-            perf_trace["generation_pipeline_ms"] = int((time.time() - generation_pipeline_started_at) * 1000)
+                try:
+                    generation_pipeline_started_at = time.time()
+                    if generation_type == "image":
+                        debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
+                        async for chunk in self._handle_image_generation(
+                            token, project_id, model_config, prompt, images, stream,
+                            perf_trace=perf_trace,
+                            generation_result=generation_result,
+                            request_log_state=request_log_state,
+                            pending_token_state=pending_token_state
+                        ):
+                            yield chunk
+                    else:
+                        debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
+                        async for chunk in self._handle_video_generation(
+                            token, project_id, model_config, prompt, images, stream,
+                            perf_trace=perf_trace,
+                            generation_result=generation_result,
+                            request_log_state=request_log_state,
+                            pending_token_state=pending_token_state
+                        ):
+                            yield chunk
+                    perf_trace["generation_pipeline_ms"] = int((time.time() - generation_pipeline_started_at) * 1000)
+                    break
+                except Exception as e:
+                    error_text = str(e)
+                    is_auth_error = ("401" in error_text or "UNAUTHENTICATED" in error_text or "invalid authentication credentials" in error_text.lower())
+                    if token and is_auth_error and generation_attempt < 2:
+                        debug_logger.log_warning(f"[GENERATION] Token {token.id} 命中上游认证错误，记录错误并切换 token 重试: {error_text}")
+                        await self.token_manager.record_error(token.id)
+                        if pending_token_state.get("active") and self.load_balancer:
+                            await self.load_balancer.release_pending(
+                                token.id,
+                                for_image_generation=(generation_type == "image"),
+                                for_video_generation=(generation_type == "video"),
+                            )
+                            pending_token_state["active"] = False
+                        if generation_type == "image":
+                            next_token = await self.load_balancer.select_token(
+                                for_image_generation=True,
+                                model=model,
+                                reserve=False,
+                                enforce_concurrency_filter=False,
+                                track_pending=True,
+                            )
+                        else:
+                            next_token = await self.load_balancer.select_token(
+                                for_video_generation=True,
+                                model=model,
+                                reserve=False,
+                                enforce_concurrency_filter=False,
+                                track_pending=True,
+                            )
+                        if next_token and next_token.id != token.id:
+                            token = next_token
+                            pending_token_state["active"] = True
+                            generation_result["success"] = False
+                            generation_result["error_message"] = None
+                            generation_result["error_emitted"] = False
+                            if stream:
+                                yield self._create_stream_chunk("⚠️ 当前 token 认证失效，自动切换下一个 token 重试...\n")
+                            continue
+                    raise
 
             # 6. 记录使用
             if not generation_result.get("success"):
@@ -1446,13 +1489,18 @@ class GenerationHandler:
             # I2V: 首尾帧处理
             if video_type == "i2v" and images:
                 if image_count == 1:
-                    # 只有1张图: 仅作为首帧
+                    # 只有1张图：对外仍视为 I2V，但内部改走新版 R2V 视觉输入协议，
+                    # 避免旧的 StartImage 上游 schema 与当前 Veo/LMRoot 不兼容。
                     if stream:
-                        yield self._create_stream_chunk("上传首帧图片...\n")
+                        yield self._create_stream_chunk("上传参考图片...\n")
                     start_media_id = await self.flow_client.upload_image(
                         token.at, images[0], model_config["aspect_ratio"], project_id=project_id
                     )
-                    debug_logger.log_info(f"[I2V] 仅上传首帧: {start_media_id}")
+                    reference_images.append({
+                        "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
+                        "mediaId": start_media_id
+                    })
+                    debug_logger.log_info(f"[I2V->R2V] 单图模式改走 referenceImages: {start_media_id}")
 
                 elif image_count == 2:
                     # 2张图: 首帧+尾帧
@@ -1487,7 +1535,7 @@ class GenerationHandler:
             submit_started_at = time.time()
 
             # I2V: 首尾帧生成
-            if video_type == "i2v" and start_media_id:
+            if video_type == "i2v" and (start_media_id or reference_images):
                 if end_media_id:
                     # 有首尾帧
                     result = await self.flow_client.generate_video_start_end(
@@ -1502,14 +1550,41 @@ class GenerationHandler:
                         token_id=token.id,
                         token_video_concurrency=token.video_concurrency,
                     )
+                elif reference_images:
+                    # 单图 I2V：内部改走新版 R2V 请求体，但保持用户侧模型/用法不变。
+                    actual_model_key = model_config["model_key"]
+                    i2v_to_r2v_model_map = {
+                        "veo_3_1_i2v_s_fast_fl": "veo_3_1_r2v_fast_landscape",
+                        "veo_3_1_i2v_s_fast_portrait_fl": "veo_3_1_r2v_fast_portrait",
+                        "veo_3_1_i2v_s_fast_ultra_fl": "veo_3_1_r2v_fast_landscape_ultra",
+                        "veo_3_1_i2v_s_fast_portrait_ultra_fl": "veo_3_1_r2v_fast_portrait_ultra",
+                        "veo_3_1_i2v_s_fast_ultra_relaxed": "veo_3_1_r2v_fast_landscape_ultra_relaxed",
+                        "veo_3_1_i2v_s_fast_portrait_ultra_relaxed": "veo_3_1_r2v_fast_portrait_ultra_relaxed",
+                        # 非 fast 3.1 基础款
+                        "veo_3_1_i2v_s_landscape": "veo_3_1_r2v_fast_landscape",
+                        "veo_3_1_i2v_s_portrait": "veo_3_1_r2v_fast_portrait",
+                        # 2.x 先保守回退到原模型，避免误映射
+                        "veo_2_1_fast_d_15_i2v_landscape": "veo_2_1_fast_d_15_i2v_landscape",
+                        "veo_2_1_fast_d_15_i2v_portrait": "veo_2_1_fast_d_15_i2v_portrait",
+                        "veo_2_0_i2v_landscape": "veo_2_0_i2v_landscape",
+                        "veo_2_0_i2v_portrait": "veo_2_0_i2v_portrait",
+                    }
+                    r2v_model_key = i2v_to_r2v_model_map.get(actual_model_key, actual_model_key)
+                    debug_logger.log_info(f"[I2V->R2V] 单图模式模型映射: {actual_model_key} -> {r2v_model_key}")
+                    result = await self.flow_client.generate_video_reference_images(
+                        at=token.at,
+                        project_id=project_id,
+                        prompt=prompt,
+                        model_key=r2v_model_key,
+                        aspect_ratio=model_config["aspect_ratio"],
+                        reference_images=reference_images,
+                        user_paygate_tier=normalized_tier,
+                        token_id=token.id,
+                        token_video_concurrency=token.video_concurrency,
+                    )
                 else:
-                    # 只有首帧 - 需要去掉 model_key 中的 _fl
-                    # 情况1: _fl_ 在中间 (如 veo_3_1_i2v_s_fast_fl_ultra_relaxed -> veo_3_1_i2v_s_fast_ultra_relaxed)
-                    # 情况2: _fl 在结尾 (如 veo_3_1_i2v_s_fast_ultra_fl -> veo_3_1_i2v_s_fast_ultra)
-                    actual_model_key = model_config["model_key"].replace("_fl_", "_")
-                    if actual_model_key.endswith("_fl"):
-                        actual_model_key = actual_model_key[:-3]
-                    debug_logger.log_info(f"[I2V] 单帧模式，model_key: {model_config['model_key']} -> {actual_model_key}")
+                    actual_model_key = model_config["model_key"]
+                    debug_logger.log_info(f"[I2V] 单帧模式，保持 model_key 不变: {actual_model_key}")
                     result = await self.flow_client.generate_video_start_image(
                         at=token.at,
                         project_id=project_id,

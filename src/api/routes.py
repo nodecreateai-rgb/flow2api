@@ -115,13 +115,33 @@ async def retrieve_image_data(url: str) -> Optional[bytes]:
                 impersonate="chrome110",
                 verify=False,
             )
-            if response.status_code == 200:
+            if response.status_code == 200 and response.content:
                 return response.content
             debug_logger.log_warning(
-                f"[CONTEXT] 图片下载失败，状态码: {response.status_code}"
+                f"[CONTEXT] curl_cffi 图片下载失败，状态码: {response.status_code}"
             )
     except Exception as exc:
-        debug_logger.log_error(f"[CONTEXT] 图片下载异常: {str(exc)}")
+        debug_logger.log_error(f"[CONTEXT] curl_cffi 图片下载异常: {str(exc)}")
+
+    # 对 GCS 签名图、部分 CDN 或 curl_cffi 不稳定场景，回退到 requests。
+    try:
+        import requests
+        response = requests.get(
+            url,
+            timeout=30,
+            verify=False,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            },
+        )
+        if response.status_code == 200 and response.content:
+            return response.content
+        debug_logger.log_warning(
+            f"[CONTEXT] requests 图片下载失败，状态码: {response.status_code}"
+        )
+    except Exception as exc:
+        debug_logger.log_error(f"[CONTEXT] requests 图片下载异常: {str(exc)}")
 
     return None
 

@@ -1483,7 +1483,11 @@ class FlowClient:
                     "aspectRatio": aspect_ratio,
                     "seed": random.randint(1, 99999),
                     "textInput": {
-                        "prompt": prompt
+                        "structuredPrompt": {
+                            "parts": [{
+                                "text": prompt
+                            }]
+                        }
                     },
                     "videoModelKey": model_key,
                     "startImage": {
@@ -1495,7 +1499,8 @@ class FlowClient:
                     "metadata": {
                         "sceneId": scene_id
                     }
-                }]
+                }],
+                "useV2ModelConfig": True
             }
 
             try:
@@ -1609,7 +1614,11 @@ class FlowClient:
                     "aspectRatio": aspect_ratio,
                     "seed": random.randint(1, 99999),
                     "textInput": {
-                        "prompt": prompt
+                        "structuredPrompt": {
+                            "parts": [{
+                                "text": prompt
+                            }]
+                        }
                     },
                     "videoModelKey": model_key,
                     "startImage": {
@@ -1619,7 +1628,8 @@ class FlowClient:
                     "metadata": {
                         "sceneId": scene_id
                     }
-                }]
+                }],
+                "useV2ModelConfig": True
             }
 
             try:
