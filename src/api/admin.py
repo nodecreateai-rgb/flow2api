@@ -1878,15 +1878,31 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
         if not email:
             raise HTTPException(status_code=400, detail="Failed to get email from session token")
 
-        # Parse expiration time
-        from datetime import datetime
-        at_expires = None
-        if expires:
-            try:
-                at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
-            except:
-                pass
+        if not at:
+            raise HTTPException(status_code=400, detail=f"Session token did not return access_token for {email}")
+        if not expires:
+            raise HTTPException(status_code=400, detail=f"Session token did not return expires for {email}")
 
+        # Parse expiration time
+        from datetime import datetime, timezone
+        try:
+            at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid expires from session token for {email}: {expires} ({str(e)})"
+            )
+
+        now = datetime.now(timezone.utc)
+        expires_aware = at_expires if at_expires.tzinfo else at_expires.replace(tzinfo=timezone.utc)
+        if expires_aware <= now:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Session token converted to an expired access token for {email}"
+            )
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid session token: {str(e)}")
 
@@ -1896,13 +1912,32 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     if existing_token:
         # Update existing token
         try:
-            # Update token
             await token_manager.update_token(
                 token_id=existing_token.id,
                 st=session_token,
                 at=at,
                 at_expires=at_expires
             )
+
+            updated_token = await db.get_token(existing_token.id)
+            if not updated_token:
+                raise HTTPException(status_code=500, detail=f"Token disappeared after update for {email}")
+            if updated_token.st != session_token:
+                raise HTTPException(status_code=500, detail=f"ST persistence verification failed for {email}")
+            if updated_token.at != at:
+                raise HTTPException(status_code=500, detail=f"AT persistence verification failed for {email}")
+            updated_expires = updated_token.at_expires
+            if updated_expires is None:
+                raise HTTPException(status_code=500, detail=f"AT expiry persistence verification failed for {email}: stored null")
+            updated_expires_aware = updated_expires if updated_expires.tzinfo else updated_expires.replace(tzinfo=timezone.utc)
+            if updated_expires_aware != expires_aware:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"AT expiry persistence verification failed for {email}: "
+                        f"expected {expires_aware.isoformat()}, got {updated_expires_aware.isoformat()}"
+                    )
+                )
 
             # Check if auto-enable is enabled and token is disabled
             if plugin_config.auto_enable_on_update and not existing_token.is_active:
@@ -1911,14 +1946,20 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                     "success": True,
                     "message": f"Token updated and auto-enabled for {email}",
                     "action": "updated",
-                    "auto_enabled": True
+                    "auto_enabled": True,
+                    "email": email,
+                    "at_expires": expires_aware.isoformat(),
                 }
 
             return {
                 "success": True,
                 "message": f"Token updated for {email}",
-                "action": "updated"
+                "action": "updated",
+                "email": email,
+                "at_expires": expires_aware.isoformat(),
             }
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to update token: {str(e)}")
     else:
@@ -1929,11 +1970,22 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 remark="Added by Chrome Extension"
             )
 
+            created_token = await db.get_token(new_token.id)
+            if not created_token:
+                raise HTTPException(status_code=500, detail=f"Token disappeared after add for {email}")
+            created_expires = created_token.at_expires
+            if not created_token.at or created_expires is None:
+                raise HTTPException(status_code=500, detail=f"Token add persistence verification failed for {email}")
+
             return {
                 "success": True,
                 "message": f"Token added for {new_token.email}",
                 "action": "added",
-                "token_id": new_token.id
+                "token_id": new_token.id,
+                "email": new_token.email,
+                "at_expires": (created_expires if created_expires.tzinfo else created_expires.replace(tzinfo=timezone.utc)).isoformat(),
             }
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to add token: {str(e)}")

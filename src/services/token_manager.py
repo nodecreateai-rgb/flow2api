@@ -246,14 +246,17 @@ class TokenManager:
         # 检查token是否因429被禁用，如果是且未过期，则清空429状态
         token = await self.db.get_token(token_id)
         if token and token.ban_reason == "429_rate_limit":
+            # 优先使用本次传入的新 at_expires 判断，避免沿用旧库值
+            expiry_to_check = at_expires if at_expires is not None else token.at_expires
+
             # 检查token是否过期
             is_expired = False
-            if token.at_expires:
+            if expiry_to_check:
                 now = datetime.now(timezone.utc)
-                if token.at_expires.tzinfo is None:
-                    at_expires_aware = token.at_expires.replace(tzinfo=timezone.utc)
+                if expiry_to_check.tzinfo is None:
+                    at_expires_aware = expiry_to_check.replace(tzinfo=timezone.utc)
                 else:
-                    at_expires_aware = token.at_expires
+                    at_expires_aware = expiry_to_check
                 is_expired = at_expires_aware <= now
 
             # 如果未过期，清空429禁用状态
