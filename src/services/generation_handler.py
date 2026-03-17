@@ -1133,6 +1133,68 @@ class GenerationHandler:
         else:
             return "没有可用的Token进行视频生成。所有Token都处于禁用、冷却、配额耗尽或已过期状态。"
 
+    async def _generate_image_with_internal_retry(
+        self,
+        token,
+        project_id: str,
+        model_config: dict,
+        prompt: str,
+        image_inputs: Optional[List[Dict[str, Any]]],
+        stream: bool,
+    ) -> tuple[dict, str, Dict[str, Any]]:
+        """在 generation_handler 层再包一层整次图片生成重试，吞掉偶发 500/验证码/网络抖动。"""
+        max_attempts = 3
+        merged_trace: Dict[str, Any] = {
+            "handler_retry_attempts": [],
+        }
+        last_error: Optional[Exception] = None
+
+        for attempt in range(max_attempts):
+            started_at = time.time()
+            try:
+                result, generation_session_id, upstream_trace = await self.flow_client.generate_image(
+                    at=token.at,
+                    project_id=project_id,
+                    prompt=prompt,
+                    model_name=model_config["model_name"],
+                    aspect_ratio=model_config["aspect_ratio"],
+                    image_inputs=image_inputs,
+                    token_id=token.id,
+                    token_image_concurrency=token.image_concurrency,
+                )
+                merged_trace["handler_retry_attempts"].append({
+                    "attempt": attempt + 1,
+                    "success": True,
+                    "duration_ms": int((time.time() - started_at) * 1000),
+                })
+                if isinstance(upstream_trace, dict):
+                    upstream_trace = dict(upstream_trace)
+                    upstream_trace["handler_retry_attempts"] = merged_trace["handler_retry_attempts"]
+                return result, generation_session_id, upstream_trace
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+                retry_reason = self.flow_client._get_retry_reason(error_str)
+                timeout_retry = self.flow_client._is_timeout_error(e)
+                is_retryable = bool(retry_reason or timeout_retry)
+                merged_trace["handler_retry_attempts"].append({
+                    "attempt": attempt + 1,
+                    "success": False,
+                    "duration_ms": int((time.time() - started_at) * 1000),
+                    "retry_reason": retry_reason or ("网络超时" if timeout_retry else None),
+                    "error": error_str[:240],
+                })
+                if not is_retryable or attempt >= max_attempts - 1:
+                    raise
+                debug_logger.log_warning(
+                    f"[IMAGE] 整次生成遇到可重试错误，内部自动重试 ({attempt + 2}/{max_attempts})：{error_str}"
+                )
+                await asyncio.sleep(1)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("图片生成失败")
+
     async def _handle_image_generation(
         self,
         token,
@@ -1194,15 +1256,13 @@ class GenerationHandler:
                 yield self._create_stream_chunk("正在生成图片...\n")
 
             generate_started_at = time.time()
-            result, generation_session_id, upstream_trace = await self.flow_client.generate_image(
-                at=token.at,
+            result, generation_session_id, upstream_trace = await self._generate_image_with_internal_retry(
+                token=token,
                 project_id=project_id,
+                model_config=model_config,
                 prompt=prompt,
-                model_name=model_config["model_name"],
-                aspect_ratio=model_config["aspect_ratio"],
                 image_inputs=image_inputs,
-                token_id=token.id,
-                token_image_concurrency=token.image_concurrency,
+                stream=stream,
             )
             if image_trace is not None:
                 image_trace["generate_api_ms"] = int((time.time() - generate_started_at) * 1000)
