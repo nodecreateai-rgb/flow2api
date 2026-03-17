@@ -341,6 +341,7 @@ class FlowClient:
             for keyword in [
                 "curl: (6)",
                 "curl: (7)",
+                "curl: (16)",
                 "curl: (28)",
                 "curl: (35)",
                 "curl: (52)",
@@ -351,6 +352,8 @@ class FlowClient:
                 "ssl connect error",
                 "tls connect error",
                 "network is unreachable",
+                "http/2",
+                "framing layer",
             ]
         )
 
@@ -427,6 +430,7 @@ class FlowClient:
         """识别可重试的 TLS/连接类网络错误。"""
         error_lower = (error_str or "").lower()
         return any(keyword in error_lower for keyword in [
+            "curl: (16)",
             "curl: (35)",
             "curl: (52)",
             "curl: (56)",
@@ -443,6 +447,8 @@ class FlowClient:
             "connection refused",
             "network is unreachable",
             "remote host closed connection",
+            "http/2 stream",
+            "framing layer",
         ])
 
     def _get_control_plane_timeout(self) -> int:
