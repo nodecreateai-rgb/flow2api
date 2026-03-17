@@ -486,7 +486,7 @@ class FlowClient:
         at: str,
         attempt_trace: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """图片生成请求使用更短超时，并在网络超时时快速重试。"""
+        """图片生成请求使用更短超时，并在网络层可重试错误时快速重试。"""
         request_timeout = config.flow_image_request_timeout
         total_attempts = max(1, config.flow_image_timeout_retry_count + 1)
         retry_delay = config.flow_image_timeout_retry_delay
@@ -552,13 +552,17 @@ class FlowClient:
                 return result
             except Exception as e:
                 last_error = e
+                is_timeout_error = bool(self._is_timeout_error(e))
+                retry_reason = self._get_retry_reason(str(e))
+                retryable_network_error = retry_reason == "网络/TLS错误"
                 if http_attempt_info is not None:
                     http_attempt_info["duration_ms"] = int((time.time() - http_attempt_started_at) * 1000)
                     http_attempt_info["success"] = False
-                    http_attempt_info["timeout_error"] = bool(self._is_timeout_error(e))
+                    http_attempt_info["timeout_error"] = is_timeout_error
+                    http_attempt_info["retry_reason"] = retry_reason
                     http_attempt_info["error"] = str(e)[:240]
                     attempt_trace.setdefault("http_attempts", []).append(http_attempt_info)
-                if not self._is_timeout_error(e) or attempt_index >= total_attempts - 1:
+                if (not is_timeout_error and not retryable_network_error) or attempt_index >= total_attempts - 1:
                     raise
 
                 if has_media_proxy and total_attempts > 1:
@@ -568,9 +572,10 @@ class FlowClient:
                 else:
                     next_prefer_media_proxy = prefer_media_proxy
                 next_route_label = "媒体代理链路" if next_prefer_media_proxy else "打码链路"
+                retry_label = retry_reason or "网络错误"
                 debug_logger.log_warning(
-                    f"[IMAGE] 图片生成请求网络超时，准备快速重试 "
-                    f"({attempt_index + 2}/{total_attempts})，当前链路={route_label}，"
+                    f"[IMAGE] 图片生成请求遇到可重试错误，准备快速重试 "
+                    f"({attempt_index + 2}/{total_attempts})，原因={retry_label}，当前链路={route_label}，"
                     f"下一链路={next_route_label}，timeout={request_timeout}s"
                 )
                 if retry_delay > 0:
