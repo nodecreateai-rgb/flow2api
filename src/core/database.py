@@ -1370,7 +1370,7 @@ class Database:
         if admin_config:
             config.set_admin_username_from_db(admin_config.username)
             config.set_admin_password_from_db(admin_config.password)
-            config.api_key = admin_config.api_key
+            config.set_api_key_from_db(admin_config.api_key)
 
         # Reload cache config
         cache_config = await self.get_cache_config()

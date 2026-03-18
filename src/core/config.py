@@ -10,6 +10,7 @@ class Config:
         self._config = self._load_config()
         self._admin_username: Optional[str] = None
         self._admin_password: Optional[str] = None
+        self._api_key_source: str = "file"
 
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from setting.toml"""
@@ -231,6 +232,18 @@ class Config:
     @api_key.setter
     def api_key(self, value: str):
         self._config["global"]["api_key"] = value
+
+    @property
+    def api_key_source(self) -> str:
+        return self._api_key_source
+
+    def set_api_key_from_db(self, value: str):
+        self._config["global"]["api_key"] = value
+        self._api_key_source = "db"
+
+    def set_api_key_from_file(self, value: str):
+        self._config["global"]["api_key"] = value
+        self._api_key_source = "file"
 
     @property
     def admin_password(self) -> str:

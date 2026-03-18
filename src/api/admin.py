@@ -1190,6 +1190,7 @@ async def get_admin_config(token: str = Depends(verify_admin_token)):
     return {
         "admin_username": admin_config.username,
         "api_key": admin_config.api_key,
+        "api_key_source": config.api_key_source,
         "error_ban_threshold": admin_config.error_ban_threshold,
         "debug_enabled": config.debug_enabled  # Return actual debug status
     }
