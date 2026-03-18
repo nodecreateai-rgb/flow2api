@@ -71,25 +71,25 @@ class Config:
 
     @property
     def flow_image_request_timeout(self) -> int:
-        """图片生成单次 HTTP 请求超时(秒)。"""
-        default_timeout = min(self.flow_timeout, 40)
+        """图片生成单次 HTTP 请求超时(秒)。默认覆盖长尾 100s+ 场景，避免过早超时。"""
+        default_timeout = max(self.flow_timeout, min(self.image_timeout, 180))
         timeout = self._config.get("flow", {}).get(
             "image_request_timeout",
             default_timeout
         )
         try:
-            return max(5, int(timeout))
+            return max(30, min(600, int(timeout)))
         except Exception:
-            return self.flow_timeout
+            return default_timeout
 
     @property
     def flow_image_timeout_retry_count(self) -> int:
-        """图片生成遇到网络超时时的快速重试次数。"""
-        retry_count = self._config.get("flow", {}).get("image_timeout_retry_count", 1)
+        """图片生成遇到网络超时/TLS错误时的单次 HTTP 快速重试次数。"""
+        retry_count = self._config.get("flow", {}).get("image_timeout_retry_count", 0)
         try:
-            return max(0, min(3, int(retry_count)))
+            return max(0, min(2, int(retry_count)))
         except Exception:
-            return 1
+            return 0
 
     @property
     def flow_image_timeout_retry_delay(self) -> float:

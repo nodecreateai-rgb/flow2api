@@ -1876,27 +1876,29 @@ class FlowClient:
     ) -> bool:
         """统一处理生成链路的重试判定与打码自愈通知。"""
         error_str = str(error)
+        timeout_retry = self._is_timeout_error(error)
         retry_reason = self._get_retry_reason(error_str)
-        notify_reason = retry_reason or error_str[:120] or type(error).__name__
+        notify_reason = retry_reason or ("网络超时" if timeout_retry else None) or error_str[:120] or type(error).__name__
         await self._notify_browser_captcha_error(
             browser_id=browser_id,
             project_id=project_id,
             error_reason=notify_reason,
             error_message=error_str,
         )
-        if not retry_reason:
+        if not retry_reason and not timeout_retry:
             return False
 
         is_terminal_attempt = retry_attempt >= max_retries - 1
+        effective_reason = retry_reason or "网络超时"
 
         if is_terminal_attempt:
             debug_logger.log_warning(
-                f"{log_prefix}遇到{retry_reason}，已达到最大重试次数({max_retries})，本次请求失败并执行关闭回收。"
+                f"{log_prefix}遇到{effective_reason}，已达到最大重试次数({max_retries})，本次请求失败并执行关闭回收。"
             )
             return False
 
         debug_logger.log_warning(
-            f"{log_prefix}遇到{retry_reason}，正在重新获取验证码重试 ({retry_attempt + 2}/{max_retries})..."
+            f"{log_prefix}遇到{effective_reason}，正在重新获取验证码重试 ({retry_attempt + 2}/{max_retries})..."
         )
         await asyncio.sleep(1)
         return True
