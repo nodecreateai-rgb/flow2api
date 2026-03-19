@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 import time
+from contextlib import suppress
 from typing import Optional, AsyncGenerator, List, Dict, Any
 from ..core.logger import debug_logger
 from ..core.config import config
@@ -712,6 +713,45 @@ class GenerationHandler:
             return text
         return f"{text[:max_length - 3]}..."
 
+    def _resolve_image_submit_timeout(self, model_config: Dict[str, Any]) -> float:
+        """控制首段图片 submit 的最长等待，避免在 submitting_image 长时间无收口。"""
+        base_timeout = max(30, int(getattr(config, "flow_image_request_timeout", 120) or 120))
+        stage_cap = 150 if model_config.get("upsample") else 180
+        return float(max(60, min(base_timeout, stage_cap)))
+
+    def _resolve_image_upsample_timeout(self, upsample_resolution: str) -> float:
+        """控制 2K/4K 放大阶段的最长等待。"""
+        base_timeout = max(60, int(getattr(config, "upsample_timeout", 300) or 300))
+        stage_cap = 120 if "2K" in str(upsample_resolution or "") else 180
+        return float(max(60, min(base_timeout, stage_cap)))
+
+    def _resolve_image_stage_heartbeat_seconds(self, upsample: bool = False) -> float:
+        """提交/放大阶段的心跳间隔。"""
+        return 10.0 if upsample else 10.0
+
+    def _calculate_stage_progress(
+        self,
+        start_progress: int,
+        end_progress: int,
+        elapsed_seconds: float,
+        timeout_seconds: float,
+    ) -> int:
+        """根据阶段耗时平滑推进进度，避免长时间卡在同一个百分比。"""
+        if timeout_seconds <= 0:
+            return max(start_progress, end_progress)
+        clamped_elapsed = max(0.0, min(float(elapsed_seconds), float(timeout_seconds)))
+        ratio = clamped_elapsed / float(timeout_seconds)
+        progress = start_progress + int((end_progress - start_progress) * ratio)
+        return max(start_progress, min(end_progress, progress))
+
+    async def _cancel_pending_task(self, task: Optional[asyncio.Task]):
+        """安全取消后台等待任务，避免泄漏。"""
+        if task is None or task.done():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            await asyncio.wait_for(task, timeout=1.0)
+
     async def _fail_video_task(self, operations: Optional[List[Dict[str, Any]]], error_message: str):
         """将视频任务收口到失败态，避免残留 processing。"""
         if not operations:
@@ -1141,9 +1181,10 @@ class GenerationHandler:
         prompt: str,
         image_inputs: Optional[List[Dict[str, Any]]],
         stream: bool,
+        max_total_wait_seconds: Optional[float] = None,
     ) -> tuple[dict, str, Dict[str, Any]]:
-        """在 generation_handler 层再包一层整次图片生成重试，吞掉偶发 500/验证码/网络抖动。"""
-        max_attempts = 3
+        """保留整次图片生成 trace，但避免与 flow_client 内层重试叠加放大等待时间。"""
+        max_attempts = 1
         merged_trace: Dict[str, Any] = {
             "handler_retry_attempts": [],
         }
@@ -1161,6 +1202,7 @@ class GenerationHandler:
                     image_inputs=image_inputs,
                     token_id=token.id,
                     token_image_concurrency=token.image_concurrency,
+                    max_total_wait_seconds=max_total_wait_seconds,
                 )
                 merged_trace["handler_retry_attempts"].append({
                     "attempt": attempt + 1,
@@ -1256,17 +1298,60 @@ class GenerationHandler:
                 yield self._create_stream_chunk("正在生成图片...\n")
 
             generate_started_at = time.time()
-            result, generation_session_id, upstream_trace = await self._generate_image_with_internal_retry(
-                token=token,
-                project_id=project_id,
-                model_config=model_config,
-                prompt=prompt,
-                image_inputs=image_inputs,
-                stream=stream,
+            submit_timeout_seconds = self._resolve_image_submit_timeout(model_config)
+            submit_heartbeat_seconds = self._resolve_image_stage_heartbeat_seconds(upsample=False)
+            submit_heartbeat_count = 0
+            generate_task = asyncio.create_task(
+                self._generate_image_with_internal_retry(
+                    token=token,
+                    project_id=project_id,
+                    model_config=model_config,
+                    prompt=prompt,
+                    image_inputs=image_inputs,
+                    stream=stream,
+                    max_total_wait_seconds=submit_timeout_seconds,
+                )
             )
+            try:
+                while True:
+                    try:
+                        result, generation_session_id, upstream_trace = await asyncio.wait_for(
+                            asyncio.shield(generate_task),
+                            timeout=submit_heartbeat_seconds,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        elapsed_seconds = time.time() - generate_started_at
+                        if elapsed_seconds >= submit_timeout_seconds:
+                            await self._cancel_pending_task(generate_task)
+                            raise TimeoutError(
+                                f"图片提交超时（>{int(submit_timeout_seconds)}s），已提前终止"
+                            )
+                        submit_heartbeat_count += 1
+                        heartbeat_progress = self._calculate_stage_progress(
+                            28,
+                            74,
+                            elapsed_seconds,
+                            submit_timeout_seconds,
+                        )
+                        await self._update_request_log_progress(
+                            request_log_state,
+                            token_id=token.id,
+                            status_text="submitting_image",
+                            progress=heartbeat_progress,
+                            response_extra={"elapsed_ms": int(elapsed_seconds * 1000)},
+                        )
+                        if stream:
+                            yield self._create_stream_chunk(
+                                f"图片生成中，已等待 {int(elapsed_seconds)}s...\n"
+                            )
+            finally:
+                await self._cancel_pending_task(generate_task)
             if image_trace is not None:
                 image_trace["generate_api_ms"] = int((time.time() - generate_started_at) * 1000)
                 image_trace["upstream_trace"] = upstream_trace
+                image_trace["submit_timeout_s"] = int(submit_timeout_seconds)
+                image_trace["submit_heartbeat_count"] = submit_heartbeat_count
                 attempts = upstream_trace.get("generation_attempts") if isinstance(upstream_trace, dict) else None
                 if isinstance(attempts, list) and attempts:
                     first_attempt = attempts[0] if isinstance(attempts[0], dict) else {}
@@ -1296,110 +1381,152 @@ class GenerationHandler:
                 if stream:
                     yield self._create_stream_chunk(f"正在放大图片到 {resolution_name}...\n")
 
-                # 4K/2K 图片重试逻辑 - 最多重试3次
-                max_retries = 3
-                for retry_attempt in range(max_retries):
-                    try:
-                        # 调用 upsample API
-                        encoded_image = await self.flow_client.upsample_image(
-                            at=token.at,
-                            project_id=project_id,
-                            media_id=media_id,
-                            target_resolution=upsample_resolution,
-                            user_paygate_tier=normalized_tier,
-                            session_id=generation_session_id,
-                            token_id=token.id
-                        )
-
-                        if encoded_image:
-                            debug_logger.log_info(f"[UPSAMPLE] 图片已放大到 {resolution_name}")
-
-                            if stream:
-                                yield self._create_stream_chunk(f"✅ 图片已放大到 {resolution_name}\n")
-
-                            # 缓存放大后的图片 (如果启用)
-                            # 日志统一记录原图URL + 2K/4K 信息
-                            self._last_generated_url = image_url
-                            self._last_generation_assets = {
-                                "type": "image",
-                                "origin_image_url": image_url,
-                                "upscaled_image": {
-                                    "resolution": resolution_name,
-                                    "base64": encoded_image
-                                }
-                            }
-
-                            if config.cache_enabled:
-                                try:
-                                    if stream:
-                                        yield self._create_stream_chunk(f"缓存 {resolution_name} 图片中...\n")
-                                    cached_filename = await self.file_cache.cache_base64_image(encoded_image, resolution_name)
-                                    local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
-                                    self._last_generation_assets["upscaled_image"]["local_url"] = local_url
-                                    self._last_generation_assets["upscaled_image"]["url"] = local_url
-                                    self._mark_generation_succeeded(generation_result)
-                                    if stream:
-                                        yield self._create_stream_chunk(f"✅ {resolution_name} 图片缓存成功\n")
-                                        yield self._create_stream_chunk(
-                                            f"![Generated Image]({local_url})",
-                                            finish_reason="stop"
-                                        )
-                                    else:
-                                        yield self._create_completion_response(
-                                            local_url,
-                                            media_type="image"
-                                        )
-                                    if image_trace is not None:
-                                        image_trace["upsample_ms"] = int((time.time() - upsample_started_at) * 1000)
-                                    return
-                                except Exception as e:
-                                    debug_logger.log_error(f"Failed to cache {resolution_name} image: {str(e)}")
-                                    if stream:
-                                        cache_error = self._normalize_error_message(e, max_length=120)
-                                        yield self._create_stream_chunk(f"⚠️ 缓存失败: {cache_error}，返回 base64...\n")
-
-                            # 缓存未启用或缓存失败，返回 base64 格式
-                            base64_url = f"data:image/jpeg;base64,{encoded_image}"
-                            self._last_generation_assets["upscaled_image"]["local_url"] = None
-                            self._last_generation_assets["upscaled_image"]["url"] = base64_url
-                            self._mark_generation_succeeded(generation_result)
+                upsample_timeout_seconds = self._resolve_image_upsample_timeout(upsample_resolution)
+                upsample_heartbeat_seconds = self._resolve_image_stage_heartbeat_seconds(upsample=True)
+                upsample_heartbeat_count = 0
+                encoded_image = ""
+                upsample_error: Optional[Exception] = None
+                upsample_task = asyncio.create_task(
+                    self.flow_client.upsample_image(
+                        at=token.at,
+                        project_id=project_id,
+                        media_id=media_id,
+                        target_resolution=upsample_resolution,
+                        user_paygate_tier=normalized_tier,
+                        session_id=generation_session_id,
+                        token_id=token.id,
+                        max_total_wait_seconds=upsample_timeout_seconds,
+                    )
+                )
+                try:
+                    while True:
+                        try:
+                            encoded_image = await asyncio.wait_for(
+                                asyncio.shield(upsample_task),
+                                timeout=upsample_heartbeat_seconds,
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            elapsed_seconds = time.time() - upsample_started_at
+                            if elapsed_seconds >= upsample_timeout_seconds:
+                                await self._cancel_pending_task(upsample_task)
+                                raise TimeoutError(
+                                    f"图片放大到 {resolution_name} 超时（>{int(upsample_timeout_seconds)}s）"
+                                )
+                            upsample_heartbeat_count += 1
+                            heartbeat_progress = self._calculate_stage_progress(
+                                82,
+                                96,
+                                elapsed_seconds,
+                                upsample_timeout_seconds,
+                            )
+                            await self._update_request_log_progress(
+                                request_log_state,
+                                token_id=token.id,
+                                status_text=f"upsampling_{resolution_name.lower()}",
+                                progress=heartbeat_progress,
+                                response_extra={
+                                    "elapsed_ms": int(elapsed_seconds * 1000),
+                                    "target_resolution": resolution_name,
+                                },
+                            )
                             if stream:
                                 yield self._create_stream_chunk(
-                                    f"![Generated Image]({base64_url})",
+                                    f"图片放大到 {resolution_name} 中，已等待 {int(elapsed_seconds)}s...\n"
+                                )
+                except Exception as e:
+                    upsample_error = e
+                finally:
+                    await self._cancel_pending_task(upsample_task)
+
+                if image_trace is not None:
+                    image_trace["upsample_ms"] = int((time.time() - upsample_started_at) * 1000)
+                    image_trace["upsample_timeout_s"] = int(upsample_timeout_seconds)
+                    image_trace["upsample_heartbeat_count"] = upsample_heartbeat_count
+
+                if upsample_error is not None:
+                    error_str = str(upsample_error)
+                    debug_logger.log_error(f"[UPSAMPLE] 放大失败，回退原图: {error_str}")
+                    await self._update_request_log_progress(
+                        request_log_state,
+                        token_id=token.id,
+                        status_text="upsample_failed_fallback",
+                        progress=88,
+                        response_extra={"error": self._normalize_error_message(error_str, max_length=180)},
+                    )
+                    if stream:
+                        yield self._create_stream_chunk(f"⚠️ 放大失败: {error_str}，返回原图...\n")
+                elif encoded_image:
+                    debug_logger.log_info(f"[UPSAMPLE] 图片已放大到 {resolution_name}")
+
+                    if stream:
+                        yield self._create_stream_chunk(f"✅ 图片已放大到 {resolution_name}\n")
+
+                    # 缓存放大后的图片 (如果启用)
+                    # 日志统一记录原图URL + 2K/4K 信息
+                    self._last_generated_url = image_url
+                    self._last_generation_assets = {
+                        "type": "image",
+                        "origin_image_url": image_url,
+                        "upscaled_image": {
+                            "resolution": resolution_name,
+                            "base64": encoded_image
+                        }
+                    }
+
+                    if config.cache_enabled:
+                        try:
+                            if stream:
+                                yield self._create_stream_chunk(f"缓存 {resolution_name} 图片中...\n")
+                            cached_filename = await self.file_cache.cache_base64_image(encoded_image, resolution_name)
+                            local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
+                            self._last_generation_assets["upscaled_image"]["local_url"] = local_url
+                            self._last_generation_assets["upscaled_image"]["url"] = local_url
+                            self._mark_generation_succeeded(generation_result)
+                            if stream:
+                                yield self._create_stream_chunk(f"✅ {resolution_name} 图片缓存成功\n")
+                                yield self._create_stream_chunk(
+                                    f"![Generated Image]({local_url})",
                                     finish_reason="stop"
                                 )
                             else:
                                 yield self._create_completion_response(
-                                    base64_url,
+                                    local_url,
                                     media_type="image"
                                 )
-                            if image_trace is not None:
-                                image_trace["upsample_ms"] = int((time.time() - upsample_started_at) * 1000)
                             return
-                        else:
-                            debug_logger.log_warning("[UPSAMPLE] 返回结果为空")
+                        except Exception as e:
+                            debug_logger.log_error(f"Failed to cache {resolution_name} image: {str(e)}")
                             if stream:
-                                yield self._create_stream_chunk(f"⚠️ 放大失败，返回原图...\n")
-                            break  # 空结果不重试
+                                cache_error = self._normalize_error_message(e, max_length=120)
+                                yield self._create_stream_chunk(f"⚠️ 缓存失败: {cache_error}，返回 base64...\n")
 
-                    except Exception as e:
-                        error_str = str(e)
-                        debug_logger.log_error(f"[UPSAMPLE] 放大失败 (尝试 {retry_attempt + 1}/{max_retries}): {error_str}")
-                        
-                        # 检查是否是可重试错误（403、reCAPTCHA、超时等）
-                        retry_reason = self.flow_client._get_retry_reason(error_str)
-                        if retry_reason and retry_attempt < max_retries - 1:
-                            if stream:
-                                yield self._create_stream_chunk(f"⚠️ 放大遇到{retry_reason}，正在重试 ({retry_attempt + 2}/{max_retries})...\n")
-                            # 等待一小段时间后重试
-                            await asyncio.sleep(1)
-                            continue
-                        else:
-                            if stream:
-                                yield self._create_stream_chunk(f"⚠️ 放大失败: {error_str}，返回原图...\n")
-                            break
-                if image_trace is not None:
-                    image_trace["upsample_ms"] = int((time.time() - upsample_started_at) * 1000)
+                    # 缓存未启用或缓存失败，返回 base64 格式
+                    base64_url = f"data:image/jpeg;base64,{encoded_image}"
+                    self._last_generation_assets["upscaled_image"]["local_url"] = None
+                    self._last_generation_assets["upscaled_image"]["url"] = base64_url
+                    self._mark_generation_succeeded(generation_result)
+                    if stream:
+                        yield self._create_stream_chunk(
+                            f"![Generated Image]({base64_url})",
+                            finish_reason="stop"
+                        )
+                    else:
+                        yield self._create_completion_response(
+                            base64_url,
+                            media_type="image"
+                        )
+                    return
+                else:
+                    debug_logger.log_warning("[UPSAMPLE] 返回结果为空，回退原图")
+                    await self._update_request_log_progress(
+                        request_log_state,
+                        token_id=token.id,
+                        status_text="upsample_empty_fallback",
+                        progress=88,
+                    )
+                    if stream:
+                        yield self._create_stream_chunk("⚠️ 放大返回为空，返回原图...\n")
 
             # 1K 原图统一直接返回官方直链，避免额外下载缓存依赖 curl/wget。
             local_url = image_url

@@ -455,6 +455,115 @@ class FlowClient:
         """控制轻量控制面请求的超时，避免认证/项目接口长时间挂起。"""
         return max(5, min(int(self.timeout or 0) or 120, 10))
 
+    def _get_remaining_wait_budget_seconds(
+        self,
+        started_at: Optional[float],
+        max_total_wait_seconds: Optional[float],
+    ) -> Optional[float]:
+        """返回链路剩余总等待预算。"""
+        if started_at is None or max_total_wait_seconds is None:
+            return None
+        return float(max_total_wait_seconds) - max(0.0, (time.time() - float(started_at)))
+
+    def _resolve_request_timeout_with_budget(
+        self,
+        *,
+        base_timeout: Union[int, float],
+        operation_label: str,
+        started_at: Optional[float],
+        max_total_wait_seconds: Optional[float],
+        minimum_timeout_seconds: float = 5.0,
+    ) -> int:
+        """在总预算内裁剪单次 HTTP 请求 timeout。"""
+        effective_timeout = max(float(minimum_timeout_seconds), float(base_timeout or minimum_timeout_seconds))
+        remaining_budget = self._get_remaining_wait_budget_seconds(started_at, max_total_wait_seconds)
+        if remaining_budget is not None:
+            if remaining_budget <= float(minimum_timeout_seconds):
+                raise TimeoutError(f"{operation_label} timeout budget exhausted")
+            effective_timeout = min(effective_timeout, remaining_budget)
+        return max(int(minimum_timeout_seconds), int(effective_timeout))
+
+    async def _sleep_with_wait_budget(
+        self,
+        *,
+        delay_seconds: float,
+        operation_label: str,
+        started_at: Optional[float],
+        max_total_wait_seconds: Optional[float],
+    ):
+        """在总预算内执行重试前等待。"""
+        if delay_seconds <= 0:
+            return
+        remaining_budget = self._get_remaining_wait_budget_seconds(started_at, max_total_wait_seconds)
+        if remaining_budget is not None:
+            if remaining_budget <= 0:
+                raise TimeoutError(f"{operation_label} timeout budget exhausted")
+            delay_seconds = min(float(delay_seconds), float(remaining_budget))
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+
+    def _normalize_upsample_encoded_image_candidate(self, value: Any) -> Optional[str]:
+        """过滤并标准化可能的 base64 图片载荷。"""
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if normalized.startswith("data:image"):
+            _, _, payload = normalized.partition(",")
+            normalized = payload.strip()
+        if len(normalized) < 128:
+            return None
+        sample = normalized[:512]
+        if all(char.isalnum() or char in "+/=_-\r\n" for char in sample):
+            return normalized
+        return None
+
+    def _extract_upsample_encoded_image(
+        self,
+        result: Dict[str, Any],
+    ) -> tuple[str, str]:
+        """兼容不同上游响应形状，提取放大后的 base64 图片。"""
+        candidate_keys = ("encodedImage", "base64", "imageData", "data")
+        queue: List[tuple[str, Any, int]] = [("root", result, 0)]
+        visited: set[int] = set()
+
+        while queue:
+            path, current, depth = queue.pop(0)
+            current_id = id(current)
+            if current_id in visited:
+                continue
+            visited.add(current_id)
+
+            if isinstance(current, dict):
+                for key in candidate_keys:
+                    raw_value = current.get(key)
+                    if key == "encodedImage" and isinstance(raw_value, str) and raw_value.strip():
+                        value = raw_value.strip()
+                    else:
+                        value = self._normalize_upsample_encoded_image_candidate(raw_value)
+                    if value:
+                        source = f"{path}.{key}" if path else key
+                        return value, source
+                if depth >= 4:
+                    continue
+                for key, value in current.items():
+                    if isinstance(value, (dict, list)):
+                        child_path = f"{path}.{key}" if path else str(key)
+                        queue.append((child_path, value, depth + 1))
+            elif isinstance(current, list):
+                if depth >= 4:
+                    continue
+                for index, value in enumerate(current):
+                    if isinstance(value, (dict, list)):
+                        child_path = f"{path}[{index}]"
+                        queue.append((child_path, value, depth + 1))
+
+        top_level_keys = sorted(result.keys()) if isinstance(result, dict) else []
+        raise ValueError(
+            f"Upsample response missing encoded image payload; top-level keys={top_level_keys}"
+        )
+
     async def _acquire_image_launch_gate(
         self,
         token_id: Optional[int],
@@ -484,10 +593,12 @@ class FlowClient:
         url: str,
         json_data: Dict[str, Any],
         at: str,
-        attempt_trace: Optional[Dict[str, Any]] = None
+        attempt_trace: Optional[Dict[str, Any]] = None,
+        started_at: Optional[float] = None,
+        max_total_wait_seconds: Optional[float] = None,
     ) -> Dict[str, Any]:
         """图片生成请求使用更短超时，并在网络层可重试错误时快速重试。"""
-        request_timeout = config.flow_image_request_timeout
+        base_request_timeout = config.flow_image_request_timeout
         total_attempts = max(1, config.flow_image_timeout_retry_count + 1)
         retry_delay = config.flow_image_timeout_retry_delay
 
@@ -527,6 +638,12 @@ class FlowClient:
             route_label = "媒体代理链路" if prefer_media_proxy else "打码链路"
             http_attempt_started_at = time.time()
             http_attempt_info: Optional[Dict[str, Any]] = None
+            request_timeout = self._resolve_request_timeout_with_budget(
+                base_timeout=base_request_timeout,
+                operation_label="Image generation request",
+                started_at=started_at,
+                max_total_wait_seconds=max_total_wait_seconds,
+            )
             if isinstance(attempt_trace, dict):
                 http_attempt_info = {
                     "attempt": attempt_index + 1,
@@ -579,7 +696,12 @@ class FlowClient:
                     f"下一链路={next_route_label}，timeout={request_timeout}s"
                 )
                 if retry_delay > 0:
-                    await asyncio.sleep(retry_delay)
+                    await self._sleep_with_wait_budget(
+                        delay_seconds=retry_delay,
+                        operation_label="Image generation request",
+                        started_at=started_at,
+                        max_total_wait_seconds=max_total_wait_seconds,
+                    )
 
         if last_error is not None:
             raise last_error
@@ -906,6 +1028,7 @@ class FlowClient:
         image_inputs: Optional[List[Dict]] = None,
         token_id: Optional[int] = None,
         token_image_concurrency: Optional[int] = None,
+        max_total_wait_seconds: Optional[float] = None,
     ) -> tuple[dict, str, Dict[str, Any]]:
         """生成图片(同步返回)
 
@@ -932,12 +1055,21 @@ class FlowClient:
             "max_retries": max_retries,
             "generation_attempts": [],
         }
+        generation_started_at = time.time()
         
         for retry_attempt in range(max_retries):
             attempt_trace: Dict[str, Any] = {
                 "attempt": retry_attempt + 1,
                 "recaptcha_ok": False,
             }
+            remaining_budget = self._get_remaining_wait_budget_seconds(
+                generation_started_at,
+                max_total_wait_seconds,
+            )
+            if remaining_budget is not None:
+                if remaining_budget <= 0:
+                    raise TimeoutError("Image generation timeout budget exhausted")
+                attempt_trace["remaining_budget_ms"] = int(max(0.0, remaining_budget) * 1000)
             attempt_started_at = time.time()
             # 每次重试都重新获取 reCAPTCHA token
             recaptcha_started_at = time.time()
@@ -1026,6 +1158,8 @@ class FlowClient:
                     json_data=json_data,
                     at=at,
                     attempt_trace=attempt_trace,
+                    started_at=generation_started_at,
+                    max_total_wait_seconds=max_total_wait_seconds,
                 )
                 attempt_trace["success"] = True
                 attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
@@ -1064,7 +1198,8 @@ class FlowClient:
         target_resolution: str = "UPSAMPLE_IMAGE_RESOLUTION_4K",
         user_paygate_tier: str = "PAYGATE_TIER_NOT_PAID",
         session_id: Optional[str] = None,
-        token_id: Optional[int] = None
+        token_id: Optional[int] = None,
+        max_total_wait_seconds: Optional[float] = None,
     ) -> str:
         """放大图片到 2K/4K
 
@@ -1084,8 +1219,15 @@ class FlowClient:
         # 403/reCAPTCHA/500 重试逻辑 - 最多重试3次
         max_retries = 3
         last_error = None
+        upsample_started_at = time.time()
 
         for retry_attempt in range(max_retries):
+            remaining_budget = self._get_remaining_wait_budget_seconds(
+                upsample_started_at,
+                max_total_wait_seconds,
+            )
+            if remaining_budget is not None and remaining_budget <= 0:
+                raise TimeoutError("Image upsample timeout budget exhausted")
             # 获取 reCAPTCHA token - 使用 IMAGE_GENERATION action
             recaptcha_token, browser_id = await self._get_recaptcha_token(
                 project_id,
@@ -1129,11 +1271,21 @@ class FlowClient:
                     json_data=json_data,
                     use_at=True,
                     at_token=at,
-                    timeout=config.upsample_timeout
+                    timeout=self._resolve_request_timeout_with_budget(
+                        base_timeout=config.upsample_timeout,
+                        operation_label="Image upsample request",
+                        started_at=upsample_started_at,
+                        max_total_wait_seconds=max_total_wait_seconds,
+                    )
                 )
 
                 # 返回 base64 编码的图片
-                return result.get("encodedImage", "")
+                encoded_image, encoded_source = self._extract_upsample_encoded_image(result)
+                if encoded_source != "root.encodedImage":
+                    debug_logger.log_info(
+                        f"[IMAGE UPSAMPLE] 使用备用响应字段提取图片数据: {encoded_source}"
+                    )
+                return encoded_image
             except Exception as e:
                 last_error = e
                 should_retry = await self._handle_retryable_generation_error(
